@@ -27,8 +27,7 @@ CC = $(GCC_PREFIX)/gcc$(GCC_SUFFIX)
 CPP = $(GCC_PREFIX)/g++$(GCC_SUFFIX)
 CXX = $(CPP)
 HEADERS = $(wildcard *.h)
-BOWTIE_MM = 1
-BOWTIE_SHARED_MEM = 0
+FAST_SAMTOOLS_SORT_MM = 1
 
 LINUX = 1
 
@@ -63,26 +62,10 @@ else
 	PTHREAD_LIB = -lpthread
 endif
 
-SEARCH_LIBS =
-BUILD_LIBS = 
-INSPECT_LIBS =
-
-ifeq (1,$(MINGW))
-	BUILD_LIBS = 
-	INSPECT_LIBS = 
-endif
-
-SERACH_INC = 
-
 LIBS = $(PTHREAD_LIB)
 
-SHARED_CPPS = 
-SEARCH_CPPS = 
+SHARED_CPPS = tinythread.cpp
 
-CMA_CPPS_MAIN = $(SEARCH_CPPS) hisat2_main.cpp
-CMA_BUILD_CPPS_MAIN = $(BUILD_CPPS) hisat2_build_main.cpp
-
-SEARCH_FRAGMENTS = $(wildcard search_*_phase*.c)
 VERSION = $(shell cat VERSION)
 
 # Convert BITS=?? to a -m flag
@@ -107,17 +90,12 @@ ifeq (64,$(BITS))
 endif
 SSE_FLAG=-msse2
 
-DEBUG_FLAGS    = -O0 -g3 $(BIToS_FLAG) $(SSE_FLAG)
+DEBUG_FLAGS    = -O0 -g3 $(BIToS_FLAG) $(SSE_FLAG) -std=c++11
 DEBUG_DEFS     = -DCOMPILER_OPTIONS="\"$(DEBUG_FLAGS) $(EXTRA_FLAGS)\""
-RELEASE_FLAGS  = -O3 $(BITS_FLAG) $(SSE_FLAG) -funroll-loops -g3
+RELEASE_FLAGS  = -O3 $(BITS_FLAG) $(SSE_FLAG) -funroll-loops -g3 -std=c++11
 RELEASE_DEFS   = -DCOMPILER_OPTIONS="\"$(RELEASE_FLAGS) $(EXTRA_FLAGS)\""
 NOASSERT_FLAGS = -DNDEBUG
 FILE_FLAGS     = -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE
-
-ifeq (1,$(LINUX))
-	DEBUG_FLAGS    += -std=c++11
-	RELEASE_FLAGS  += -std=c++11
-endif
 
 CMA_BIN_LIST = fast-samtools-sort
 CMA_BIN_LIST_AUX = fast-samtools-sort-debug
@@ -174,7 +152,7 @@ both: fast-samtools-sort
 both-debug: fast-samtools-sort-debug
 
 DEFS=-fno-strict-aliasing \
-     -DCMA_VERSION="\"`cat VERSION`\"" \
+     -DFAST_SAMTOOLS_SORT_VERSION="\"`cat VERSION`\"" \
      -DBUILD_HOST="\"`hostname`\"" \
      -DBUILD_TIME="\"`date`\"" \
      -DCOMPILER_VERSION="\"`$(CXX) -v 2>&1 | tail -1`\"" \
@@ -183,7 +161,7 @@ DEFS=-fno-strict-aliasing \
      $(MM_DEF) \
      $(SHMEM_DEF)
 
-fast-samtools-sort: fast_samtools_sort.cpp $(SEARCH_CPPS) $(SHARED_CPPS) $(HEADERS) $(SEARCH_FRAGMENTS)
+fast-samtools-sort: fast_samtools_sort.cpp $(SHARED_CPPS) $(HEADERS)
 	$(CXX) $(RELEASE_FLAGS) $(RELEASE_DEFS) $(EXTRA_FLAGS) \
 	$(DEFS) $(NOASSERT_FLAGS) -Wall \
 	$(INC) \
@@ -191,7 +169,7 @@ fast-samtools-sort: fast_samtools_sort.cpp $(SEARCH_CPPS) $(SHARED_CPPS) $(HEADE
 	$(SHARED_CPPS) $(HISAT_CPPS_MAIN) \
 	$(LIBS) $(SEARCH_LIBS)
 
-fast-samtools-sort-debug: fast_samtools_sort.cpp $(SEARCH_CPPS) $(SHARED_CPPS) $(HEADERS) $(SEARCH_FRAGMENTS)
+fast-samtools-sort-debug: fast_samtools_sort.cpp $(SHARED_CPPS) $(HEADERS)
 	$(CXX) $(DEBUG_FLAGS) \
 	$(DEBUG_DEFS) $(EXTRA_FLAGS) \
 	$(DEFS) -Wall \
