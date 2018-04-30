@@ -25,8 +25,20 @@
 #include <cassert>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <memory>
+#include <chrono>
+
+#include "tinythread.h"
+
+// Program options
+static std::string opt_infname = "";
+static size_t opt_threads = 1;
+static size_t opt_memory = size_t(1) << 31; // 2 GB
+static size_t opt_compression = 5; // DK - we need to figure out what the default value is
+static std::string opt_outfname = "-";
+static bool opt_verbose = false;
 
 struct SamRecord {
   size_t read_id;
@@ -158,9 +170,136 @@ int simple_samtools_sort(const char* bam_fname) {
   return 0;
 }
 
+void thread_worker(void *vp) {
+}
 
-int main(int argc,char **argv) {
-  simple_samtools_sort("RNA_5M.bam");
+void thread_test() {
+  std::vector<tthread::thread*> threads(opt_threads);
+  std::vector<size_t> thread_ids(opt_threads);
+  for(size_t i = 0; i < opt_threads; i++) {
+    threads[i] = new tthread::thread(thread_worker, (void*)&thread_ids[i]);
+  }
+  
+  for(size_t i = 0; i < opt_threads; i++) {
+    threads[i]->join();
+  }
+
+  for(size_t i = 0; i < opt_threads; i++) {
+    delete threads[i];
+  }
+}
+
+void print_usage(std::ostream& out) {
+  out << "fast-samtools-sort version " << FAST_SAMTOOLS_SORT_VERSION << " by Chris Bennett (Christopher.Bennett@UTSouthwestern.edu) and Daehwan Kim (infphilo@gmail.com)" << std::endl;
+  std::string tool_name = "fast-samtools-sort";
+  out << "Usage: " << std::endl
+      << "  " << tool_name << " [options] [in.bam]" << std::endl
+      << "Options:" << std::endl
+      << "  -l INT          Compression level from 0 (no compression, fastest) to 9 (highest compression, slowest) (Default: ?)" << std::endl
+      << "  -m INT[G/M/K]   Maximum memory in total, shared by threads (Default: ?G)" << std::endl
+      << "  -o STR          Output filename" << std::endl
+      << "  -@/--threads    Number of threads (Default: 1)" << std::endl
+      << "  -v/--verbose    Verbose" << std::endl;
+}
+
+int main(int argc, char** argv) {
+  if(argc == 1) {
+    print_usage(std::cerr);
+    return 0;
+  }
+
+  // Parse options
+  opt_infname = argv[1];
+  {
+    std::ifstream f(opt_infname);
+    if(!f.good()) {
+      std::cerr << "Error: " << opt_infname << " does not exist." << std::endl;
+      return 0;
+    }
+  }
+
+  opt_outfname = opt_infname + ".sorted";
+  
+  std::set<std::string> uint_options {"-l", "-@", "--threads"};
+  std::set<std::string> str_options {"-m", "-o"};
+  std::set<std::string> arg_needed_options = uint_options; arg_needed_options.insert(str_options.begin(), str_options.end());
+  int curr_argc = 2;
+  while(curr_argc < argc) {
+    std::string option = argv[curr_argc];
+    std::string str_value = "";
+    size_t uint_value = 0;
+    if(arg_needed_options.find(option) != arg_needed_options.end()) {
+      curr_argc++;
+      if(curr_argc >= argc) {
+	std::cerr << "Error: option, " << option << ", needs an argument." << std::endl << std::endl;
+	return 0;
+      }
+      str_value = argv[curr_argc];
+      if(uint_options.find(option) != uint_options.end()) {
+	if(!std::all_of(str_value.begin(), str_value.end(), ::isdigit)) {
+	  std::cerr << "Error: option, " << option << ", needs an integer argument" << option << std::endl << std::endl;
+	  return 0;
+	}
+	uint_value = strtol(str_value.c_str(), nullptr, 10);
+      }
+    }
+    if(option == "-l") {
+      opt_compression = std::min<size_t>(9, uint_value);
+    } else if(option == "-m") {
+      size_t multi = 1;
+      char last = str_value[str_value.length() - 1];
+      if(last == 'K' || last == 'k') {
+	multi = 1 << 10;
+      } else if(last == 'M' || last == 'm') {
+	multi = 1 << 20;
+      } else if(last == 'G' || last == 'g') {
+	multi = 1 << 30;
+      }
+      uint_value = strtol(str_value.c_str(), nullptr, 10);
+      opt_memory = uint_value * multi;
+    } else if(option == "-o") {
+      opt_outfname = str_value;
+    } else if(option == "-@" || option == "--threads") {
+      opt_threads = std::max<size_t>(1, uint_value);
+    } else if(option == "-v" || option == "--verbose") {
+      opt_verbose = true;
+    } else {
+      std::cerr << "Error: unrecognized option, " << option << std::endl << std::endl;
+      return 0;
+    }
+    curr_argc++;
+  }
+
+  if(opt_verbose) {
+    size_t out_memory = opt_memory;
+    char out_memory_suffix = ' ';
+    if(out_memory > (1 << 14)) {
+      out_memory >>= 10;
+      out_memory_suffix = 'K';
+      if(out_memory > (1 << 14)) {
+	out_memory >>= 10;
+	out_memory_suffix = 'M';
+	if(out_memory > (1 << 14)) {
+	  out_memory >>= 10;
+	  out_memory_suffix = 'G';
+	}
+      }
+    }
+    std::cerr << "fast-samtools-sort is executed with the following options." << std::endl
+	      << " " << out_memory << out_memory_suffix << " memory" << std::endl
+	      << " " << opt_threads << (opt_threads == 1 ? " thread" : " threads") << std::endl;
+  }
+
+  auto program_begin = std::chrono::system_clock::now();
+
+  simple_samtools_sort(opt_infname.c_str());
+
+  auto program_end = std::chrono::system_clock::now();
+
+  if(opt_verbose) {
+    auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(program_end - program_begin).count();
+    std::cerr << "Elapsed: " << milliseconds / 1000.0 << " seconds." << std::endl;
+  }
   
   return 0;
 }
