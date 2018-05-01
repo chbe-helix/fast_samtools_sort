@@ -21,7 +21,7 @@ echo "export=PATH=~/fast-samtools/:$PATH" >> ~/.bashrc
 
 ## Usage
 ```sh
-fast-samtools-sort [-l level] [-m maxMem] [-o out.bam] [-O format] [-n] [-t tag] [-T tmpprefix] [-@ threads] [in.sam|in.bam|in.cram]
+fast-samtools-sort [-l complevel] [-m maxMem] [-o out.bam] [-@/--threads threads] [in.bam]
 ```
 
 Sort alignments by alignment position in genome.
