@@ -24,9 +24,9 @@ echo "export=PATH=~/fast-samtools/:$PATH" >> ~/.bashrc
 fast-samtools-sort [-l level] [-m maxMem] [-o out.bam] [-O format] [-n] [-t tag] [-T tmpprefix] [-@ threads] [in.sam|in.bam|in.cram]
 ```
 
-Sort alignments by leftmost coordinates, or by read name when -n is used. An appropriate @HD-SO sort order header tag will be added or an existing one updated if necessary.
+Sort alignments by alignment position in genome.
 
-The sorted output is written to standard output by default, or to the specified file (out.bam) when -o is used. This command will also create temporary files tmpprefix.%d.bam as needed when the entire alignment data cannot fit into memory (as controlled via the -m option).
+The sorted output is written to .bam.sorted file, or to the specified file (out.bam) when -o is used.
 
 Options | Description
 --------- | --------------------------
