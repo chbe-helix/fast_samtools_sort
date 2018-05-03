@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <memory>
 #include <chrono>
+#include <sstream>
 
 #include "tinythread.h"
 
@@ -37,6 +38,7 @@
 static std::string opt_infname = "";
 static size_t opt_threads = 1;
 static size_t opt_memory = size_t(1) << 31; // 2 GB
+static size_t opt_memory_per_thread = opt_memory / opt_threads;
 static size_t opt_compression = 6; // DK - we need to figure out what the default value is CB - if it's gzip compression the default is 6
 static std::string opt_outfname = "";
 static bool opt_verbose = false;
@@ -361,19 +363,19 @@ int simple_samtools_sort(const std::string& in_fname,
   cmd += (opt_sambamba ? "--nthreads " : "--threads ");
   cmd += std::to_string(opt_threads) + " ";
   cmd += in_fname;
-  std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-  if(!pipe) throw std::runtime_error("popen() failed!");
   size_t size_sofar = 0;
   char buffer[2048], line[2048];
 
   size_t* table = nullptr;
-  const size_t interval = 1000000;
+  const size_t interval = 1 << 10; // (1024)
   size_t table_size = 0;
 
   // First pass
   std::vector<std::string> headers;
   {
     Timer t(std::cerr, "\tReading BAM/SAM file: " + cmd, opt_verbose);
+    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+    if(!pipe) throw std::runtime_error("popen() failed!");
     while(!feof(pipe.get())) {
       buffer[0] = 0;
       if(fgets(buffer, 2048, pipe.get()) == nullptr) break;
@@ -384,16 +386,16 @@ int simple_samtools_sort(const std::string& in_fname,
       // Is the current line sequence info?
       bool sequence = false;
       if(header) {
-	headers.push_back(buffer);
+    	  headers.push_back(buffer);
       } else {
-	strcpy(line, buffer);
-	if(table == nullptr) {
-	  table_size = (size_sofar + interval - 1) / interval + 1;
-	  table = new size_t[table_size];
-	  for(size_t i = 0; i < table_size; i++) {
-	    table[i] = 0;
-	  }
-	};
+    	  strcpy(line, buffer);
+    	  if(table == nullptr) {
+    		  table_size = (size_sofar + interval - 1) / interval + 1;
+    		  table = new size_t[table_size];
+    		  for(size_t i = 0; i < table_size; i++) {
+    			  table[i] = 0;
+    		  }
+    	  };
       }
       
       // Split and parse fields
@@ -401,52 +403,119 @@ int simple_samtools_sort(const std::string& in_fname,
       char* pch = strtok(buffer, "\t");
       std::string contig_name = "";
       while(pch != nullptr) {
-	if(header) {
-	  if(field_num == 0) {
-	    sequence = (strcmp(pch, "@SQ") == 0);
-	  }
-	  if(sequence) {
-	    if(field_num == 1) { // e.g. SN:14
-	      if(strlen(pch) <= 3) {
-		throw std::runtime_error("");
-	      }
-	      std::string contig_name = pch + 3;
-	      contig2pos[contig_name] = size_sofar;
-	    } else if(field_num == 2) { // e.g. LN:107043718
-	      if(strlen(pch) <= 3) {
-		throw std::runtime_error("");
-	      }
-	      char* end;
-	      size_t contig_len = strtol(pch + 3, &end, 10); //was atoi(pch + 3)
-	      size_sofar += contig_len;
-	      break;
-	    }
-	  }
-	} else {
-	  if(field_num == 2) { // chromosome or contig
-	    contig_name = pch;
-	  } else if(field_num == 3) { // position
-		  size_t pos = 0;
-	    if(contig_name[0] == '*') {
-	      pos = std::numeric_limits<size_t>::max();
-	      table[table_size - 1] += strlen(line);
-	    } else {
-	      pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
-	      table[(pos / interval)] += strlen(line);
-	    }
-	    break;
-	  }
-	}
-	pch = strtok(NULL, "\t");
-	field_num++;
+    	  if(header) {
+    		  if(field_num == 0) {
+    			  sequence = (strcmp(pch, "@SQ") == 0);
+    		  }
+    		  if(sequence) {
+    			  if(field_num == 1) { // e.g. SN:14
+    				  if(strlen(pch) <= 3) {
+    					  throw std::runtime_error("");
+    				  }
+    				  std::string contig_name = pch + 3;
+    				  contig2pos[contig_name] = size_sofar;
+    			  } else if(field_num == 2) { // e.g. LN:107043718
+    				  if(strlen(pch) <= 3) {
+    					  throw std::runtime_error("");
+    				  }
+    				  char* end;
+    				  size_t contig_len = strtol(pch + 3, &end, 10); //was atoi(pch + 3)
+    				  size_sofar += contig_len;
+    				  break;
+    			  }
+    		  }
+    	  } else {
+    		  if(field_num == 2) { // chromosome or contig
+    			  contig_name = pch;
+    		  } else if(field_num == 3) { // position
+    			  size_t pos = 0;
+    			  if(contig_name[0] == '*') {
+    				  pos = std::numeric_limits<size_t>::max();
+    				  table[table_size - 1] += strlen(line);
+    			  } else {
+    				  pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+    				  table[(pos / interval)] += strlen(line);
+    			  }
+    			  break;
+    		  }
+    	  }
+    	  pch = strtok(NULL, "\t");
+    	  field_num++;
       }
     }
   }  
 
-  // DK - debugging purposes
-  for(size_t i = 0; i < table_size; i++) {
-	  std::cout << i << "M: " << table[i] << std::endl;
+  size_t sam_size = 0;
+  size_t file_num = 0;
+  for(size_t itr = 0; itr < table_size; itr++) {
+	  assert(sam_size <= opt_memory_per_thread);
+	  if(sam_size + table[itr] > opt_memory_per_thread) {
+		  std::cout << sam_size << "_1" << std::endl;
+		  sam_size = table[itr];
+		  file_num++;
+	  } else {
+		  sam_size += table[itr];
+		  //std::cout << sam_size << "_3" << std::endl;
+	  }
+	  table[itr] = file_num;
+	  //std::cout << opt_memory_per_thread << "_4" << std::endl;
   }
+  file_num++;
+  std::cout << opt_memory_per_thread << "_4" << std::endl;
+
+  std::ofstream vec_pipes[file_num];
+  std::stringstream filename;
+  for(size_t itr = 0 ; itr < file_num ; itr++){
+	  filename.str("");
+	  filename << "temp." << itr;
+	  vec_pipes[itr].open(filename.str());
+  }
+
+  // Second pass
+  {
+    Timer t(std::cerr, "\tReading BAM/SAM file: " + cmd, opt_verbose);
+    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+    if(!pipe) throw std::runtime_error("popen() failed!");
+    while(!feof(pipe.get())) {
+      buffer[0] = 0;
+      if(fgets(buffer, 2048, pipe.get()) == nullptr) break;
+      if(strlen(buffer) == 0) continue;
+
+      // Is the current line header?
+      bool header = (buffer[0] == '@');
+      if(!header) {
+    	  strcpy(line, buffer);
+      }
+
+      // Split and parse fields
+      int field_num = 0;
+      char* pch = strtok(buffer, "\t");
+      std::string contig_name = "";
+      while(pch != nullptr) {
+    	  if(!header) {
+    		  if(field_num == 2) { // chromosome or contig
+    			  contig_name = pch;
+    		  } else if(field_num == 3) { // position
+    			  size_t pos = 0;
+    			  if(contig_name[0] == '*') {
+    				  pos = std::numeric_limits<size_t>::max();
+    				  vec_pipes[table[table_size - 1]] << line;
+    			  } else {
+    				  pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+    				  vec_pipes[table[(pos / interval)]] << line;
+    			  }
+    			  break;
+    		  }
+    	  }
+    	  pch = strtok(NULL, "\t");
+    	  field_num++;
+      }
+    }
+  }
+
+  for(size_t itr = 0 ; itr < file_num ; itr++){
+ 	  vec_pipes[itr].close();
+   }
 
   // Write a list of blocks in SAM
 #if 0
@@ -455,16 +524,14 @@ int simple_samtools_sort(const std::string& in_fname,
   cmd += (opt_sambamba ? "--nthreads " : "--threads ");
   cmd += std::to_string(opt_threads);
   if(opt_sambamba) {
-    cmd += " -f bam -S /dev/stdin -o ";
+    cmd += " -f sam -S /dev/stdin -o ";
   } else {
-    cmd += " -bS - > ";    
+    cmd += " -S - > ";
   }
   cmd += out_fname;
 
-  
-
   {
-    Timer t(std::cerr, "\tWriting into a BAM file: " + cmd, opt_verbose);
+    Timer t(std::cerr, "\tWriting into a SAM file: " + cmd, opt_verbose);
     std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
     if(!pipe2) throw std::runtime_error("popen() failed!");
     for(size_t i = 0; i < headers.size(); i++) {
@@ -580,6 +647,8 @@ int main(int argc, char** argv) {
     }
     curr_argc++;
   }
+
+  opt_memory_per_thread = opt_memory / opt_threads;
 
   // Check if the input BAM file exists.
   {
