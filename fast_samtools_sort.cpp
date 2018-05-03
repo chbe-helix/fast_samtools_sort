@@ -37,10 +37,11 @@
 static std::string opt_infname = "";
 static size_t opt_threads = 1;
 static size_t opt_memory = size_t(1) << 31; // 2 GB
-static size_t opt_compression = 5; // DK - we need to figure out what the default value is
+static size_t opt_compression = 6; // DK - we need to figure out what the default value is CB - if it's gzip compression the default is 6
 static std::string opt_outfname = "";
 static bool opt_verbose = false;
 static bool opt_sambamba = false;
+static bool opt_sam = false; // CB Edit SAM
 
 /**
  * Use std::chrono to keep track of elapsed time between creation and
@@ -83,7 +84,6 @@ private:
   std::string    _msg;
   bool           _verbose;
 };
-
 
 struct SamRecord {
   size_t read_id;
@@ -136,7 +136,7 @@ void sortHeap(std::vector<SamRecord>& array){
 void merge(std::vector<SamRecord>& array, std::vector<SamRecord>& array1, std::vector<SamRecord>& array2){
 	array.clear();
 
-	int i, j;
+	size_t i, j;
 	for(i = 0, j = 0; i < array1.size() && j < array2.size(); ){
 		if(array1[i].pos <= array2[j].pos){
 			array.push_back(array1[i]);
@@ -167,6 +167,189 @@ void mergeSort(std::vector<SamRecord>& array){
 };
 //end CB additions ###########################################
 
+void dummy() {
+#if 0
+	  std::vector<SamRecord> samRecords;
+	  std::map<std::string, size_t> contig2pos;
+
+	  // Read BAM file
+	  std::string cmd = (opt_sambamba ? "sambamba" : "samtools");
+	  cmd += (opt_sam && opt_sambamba ? " view -h -S " : " view -h ");
+	  cmd += (opt_sambamba ? "--nthreads " : "--threads ");
+	  cmd += std::to_string(opt_threads) + " ";
+	  cmd += in_fname;
+	  std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+	  if(!pipe) throw std::runtime_error("popen() failed!");
+	  size_t size_sofar = 0;
+	  char buffer[2048];
+	  char* sam = new char[5000000000L];
+	  char* sam_cur = sam;
+
+	  size_t* table = nullptr;
+	  const size_t interval = 1;
+	  size_t table_size = 0;
+
+	 // First pass
+	  std::vector<std::string> headers;
+	  {
+	    Timer t(std::cerr, "\tReading BAM/SAM file: " + cmd, opt_verbose);
+	    while(!feof(pipe.get())) {
+	      buffer[0] = 0;
+	      if(fgets(buffer, 2048, pipe.get()) == nullptr) break;
+	      if(strlen(buffer) == 0) continue;
+
+	      // Is the current line header?
+	      bool header = (buffer[0] == '@');
+	      // Is the current line sequence info?
+	      bool sequence = false;
+	      if(header) {
+		headers.push_back(buffer);
+	      } else {
+		strcpy(sam_cur, buffer);
+		if(table == nullptr) {
+		  table_size = (size_sofar + interval - 1) / interval + 2;
+		  table = new size_t[table_size];
+		  for(size_t i = 0; i < table_size; i++) {
+		    table[i] = 0;
+		  }
+		};
+	      }
+
+	      // Split and parse fields
+	      int field_num = 0;
+	      char* pch = strtok(buffer, "\t");
+	      std::string contig_name = "";
+	      while(pch != nullptr) {
+		if(header) {
+		  if(field_num == 0) {
+		    sequence = (strcmp(pch, "@SQ") == 0);
+		  }
+		  if(sequence) {
+		    if(field_num == 1) { // e.g. SN:14
+		      if(strlen(pch) <= 3) {
+			throw std::runtime_error("");
+		      }
+		      std::string contig_name = pch + 3;
+		      contig2pos[contig_name] = size_sofar;
+		    } else if(field_num == 2) { // e.g. LN:107043718
+		      if(strlen(pch) <= 3) {
+			throw std::runtime_error("");
+		      }
+		      char* end;
+		      size_t contig_len = strtol(pch + 3, &end, 10); //was atoi(pch + 3)
+		      size_sofar += contig_len;
+		      break;
+		    }
+		  }
+		} else {
+		  if(field_num == 2) { // chromosome or contig
+		    contig_name = pch;
+		  } else if(field_num == 3) { // position
+		    SamRecord samRecord;
+		    samRecord.read_id = samRecords.size();
+		    if(contig_name[0] == '*') {
+		      samRecord.pos = std::numeric_limits<size_t>::max();
+		      table[table_size - 1] += strlen(sam_cur);
+		    } else {
+		      samRecord.pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+		      table[(samRecord.pos / interval) + 1] += strlen(sam_cur);
+		    }
+		    samRecord.line = sam_cur;
+		    sam_cur += (strlen(sam_cur) + 1);
+		    samRecords.push_back(samRecord);
+		    break;
+		  }
+		}
+		pch = strtok(NULL, "\t");
+		field_num++;
+	      }
+	    }
+	  }
+
+#if 0
+    std::cout << "Number of sam records: " << samRecords.size() << std::endl;
+    // Show the first 20 entries
+    for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
+      const SamRecord& samRecord = samRecords[i];
+      std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
+    }
+#endif
+  }
+
+  // this is the field we need to change #########################
+  // Sort
+  char* sam2 = new char[5000000000L];
+  {
+    Timer t(std::cerr, "\tSorting", opt_verbose);
+    //std::sort(samRecords.begin(), samRecords.end(), SamRecord_cmp());
+    //std::make_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
+    //std::sort_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
+    //sortHeap(samRecords);
+    //mergeSort(samRecords);
+    for(size_t i = 1; i < table_size; i++) {
+      table[i] += table[i - 1];
+    }
+    for(size_t i = 0; i < samRecords.size(); i++) {
+      const SamRecord& samRecord = samRecords[i];
+      size_t sam2_pos = 0;
+      if(samRecord.pos == std::numeric_limits<size_t>::max()) {
+	sam2_pos = table[table_size - 2];
+	table[table_size - 2] += (strlen(samRecord.line) + 1);
+      } else {
+	sam2_pos = table[samRecord.pos / interval - 1];
+	table[samRecord.pos / interval - 1] += (strlen(samRecord.line) + 1);
+      }
+      strcpy(sam2 + sam2_pos, samRecord.line);
+    }
+  }
+
+  if(opt_verbose) {
+#if 0
+    // Show the first 20 entries
+    std::cout << std::endl << std::endl;
+    std::cout << "After sorting:" << std::endl;
+    for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
+      const SamRecord& samRecord = samRecords[i];
+      std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
+    }
+#endif
+  }
+
+  // Write BAM file
+  cmd = (opt_sambamba ? "sambamba" : "samtools");
+  cmd += " view ";
+  cmd += (opt_sambamba ? "--nthreads " : "--threads ");
+  cmd += std::to_string(opt_threads);
+  if(opt_sambamba) {
+    cmd += " -f bam -S /dev/stdin -o ";
+  } else {
+    cmd += " -bS - > ";
+  }
+  cmd += out_fname;
+
+
+
+  {
+    Timer t(std::cerr, "\tWriting into a BAM file: " + cmd, opt_verbose);
+    std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
+    if(!pipe2) throw std::runtime_error("popen() failed!");
+    for(size_t i = 0; i < headers.size(); i++) {
+      fputs(headers[i].c_str(), pipe2.get());
+    }
+    size_t sam2_pos = 0;
+    while(true) {
+      fputs(sam2 + sam2_pos, pipe2.get());
+      sam2_pos = sam2_pos + strlen(sam2 + sam2_pos) + 1;
+    }
+  }
+
+  delete []table;
+  delete []sam;
+  delete []sam2;
+
+#endif
+}
+
 int simple_samtools_sort(const std::string& in_fname,
 			 const std::string& out_fname) {
   std::vector<SamRecord> samRecords;
@@ -174,20 +357,23 @@ int simple_samtools_sort(const std::string& in_fname,
 
   // Read BAM file
   std::string cmd = (opt_sambamba ? "sambamba" : "samtools");
-  cmd += " view -h ";
+  cmd += (opt_sam && opt_sambamba ? " view -h -S " : " view -h ");
   cmd += (opt_sambamba ? "--nthreads " : "--threads ");
   cmd += std::to_string(opt_threads) + " ";
   cmd += in_fname;
   std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
   if(!pipe) throw std::runtime_error("popen() failed!");
   size_t size_sofar = 0;
-  char buffer[2048];
-  char* sam = new char[5000000000L];
-  char* sam_cur = sam;
+  char buffer[2048], line[2048];
 
+  size_t* table = nullptr;
+  const size_t interval = 1000000;
+  size_t table_size = 0;
+
+  // First pass
   std::vector<std::string> headers;
   {
-    Timer t(std::cerr, "\tReading BAM file: " + cmd, opt_verbose);
+    Timer t(std::cerr, "\tReading BAM/SAM file: " + cmd, opt_verbose);
     while(!feof(pipe.get())) {
       buffer[0] = 0;
       if(fgets(buffer, 2048, pipe.get()) == nullptr) break;
@@ -200,7 +386,14 @@ int simple_samtools_sort(const std::string& in_fname,
       if(header) {
 	headers.push_back(buffer);
       } else {
-	strcpy(sam_cur, buffer);
+	strcpy(line, buffer);
+	if(table == nullptr) {
+	  table_size = (size_sofar + interval - 1) / interval + 1;
+	  table = new size_t[table_size];
+	  for(size_t i = 0; i < table_size; i++) {
+	    table[i] = 0;
+	  }
+	};
       }
       
       // Split and parse fields
@@ -233,16 +426,14 @@ int simple_samtools_sort(const std::string& in_fname,
 	  if(field_num == 2) { // chromosome or contig
 	    contig_name = pch;
 	  } else if(field_num == 3) { // position
-	    SamRecord samRecord;
-	    samRecord.read_id = samRecords.size();
+		  size_t pos = 0;
 	    if(contig_name[0] == '*') {
-	      samRecord.pos = std::numeric_limits<size_t>::max();
+	      pos = std::numeric_limits<size_t>::max();
+	      table[table_size - 1] += strlen(line);
 	    } else {
-	      samRecord.pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+	      pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+	      table[(pos / interval)] += strlen(line);
 	    }
-	    samRecord.line = sam_cur;
-	    sam_cur += (strlen(sam_cur) + 1);
-	    samRecords.push_back(samRecord);
 	    break;
 	  }
 	}
@@ -251,42 +442,14 @@ int simple_samtools_sort(const std::string& in_fname,
       }
     }
   }  
-  if(opt_verbose) {
-#if 0
-    std::cout << "Number of sam records: " << samRecords.size() << std::endl;
-    // Show the first 20 entries
-    for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
-      const SamRecord& samRecord = samRecords[i];
-      std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
-    }
-#endif
-  }
-  
-  
-  // this is the field we need to change #########################
-  // Sort
-  {
-    Timer t(std::cerr, "\tSorting", opt_verbose);
-    std::sort(samRecords.begin(), samRecords.end(), SamRecord_cmp());
-    //std::make_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
-    //std::sort_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
-    //sortHeap(samRecords);
-    //mergeSort(samRecords);
+
+  // DK - debugging purposes
+  for(size_t i = 0; i < table_size; i++) {
+	  std::cout << i << "M: " << table[i] << std::endl;
   }
 
-  if(opt_verbose) {
+  // Write a list of blocks in SAM
 #if 0
-    // Show the first 20 entries
-    std::cout << std::endl << std::endl;
-    std::cout << "After sorting:" << std::endl;
-    for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
-      const SamRecord& samRecord = samRecords[i];
-      std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
-    }
-#endif
-  }
-
-  // Write BAM file
   cmd = (opt_sambamba ? "sambamba" : "samtools");
   cmd += " view ";
   cmd += (opt_sambamba ? "--nthreads " : "--threads ");
@@ -298,20 +461,23 @@ int simple_samtools_sort(const std::string& in_fname,
   }
   cmd += out_fname;
 
+  
+
   {
-    Timer t(std::cerr, "\tWriting back into a BAM file: " + cmd, opt_verbose);
+    Timer t(std::cerr, "\tWriting into a BAM file: " + cmd, opt_verbose);
     std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
     if(!pipe2) throw std::runtime_error("popen() failed!");
     for(size_t i = 0; i < headers.size(); i++) {
       fputs(headers[i].c_str(), pipe2.get());
     }
-    for(size_t i = 0; i < samRecords.size(); i++) {
-      const SamRecord& samRecord = samRecords[i];
-      fputs(samRecord.line, pipe2.get());
+    size_t sam2_pos = 0;
+    while(true) {
+      fputs(sam2 + sam2_pos, pipe2.get());
+      sam2_pos = sam2_pos + strlen(sam2 + sam2_pos) + 1;
     }
   }
 
-  delete []sam;
+#endif
 
   return 0;
 }
@@ -344,6 +510,7 @@ void print_usage(std::ostream& out) {
       << "  -l INT          Compression level from 0 (no compression, fastest) to 9 (highest compression, slowest) (Default: ?)" << std::endl
       << "  -m INT[G/M/K]   Maximum memory in total, shared by threads (Default: ?G)" << std::endl
       << "  -o STR          Output filename" << std::endl
+      << "  -S/--SAM        Input File format is SAM (only needed if using Sambamba)" <<std::endl // CB Edit
       << "  -@/--threads    Number of threads (Default: 1)" << std::endl
       << "  -v/--verbose    Verbose" << std::endl;
 }
@@ -357,7 +524,8 @@ int main(int argc, char** argv) {
   // Parse options
   std::set<std::string> uint_options {"-l", "-@", "--threads"};
   std::set<std::string> str_options  {"-m", "-o"};
-  std::set<std::string> arg_needed_options = uint_options; arg_needed_options.insert(str_options.begin(), str_options.end());
+  std::set<std::string> arg_needed_options = uint_options;
+  arg_needed_options.insert(str_options.begin(), str_options.end());
   int curr_argc = 1;
   while(curr_argc < argc) {
     if(curr_argc + 1 == argc) {
@@ -375,11 +543,11 @@ int main(int argc, char** argv) {
       }
       str_value = argv[curr_argc];
       if(uint_options.find(option) != uint_options.end()) {
-	if(!std::all_of(str_value.begin(), str_value.end(), ::isdigit)) {
-	  std::cerr << "Error: option, " << option << ", needs an integer argument" << option << std::endl << std::endl;
-	  return 0;
-	}
-	uint_value = strtol(str_value.c_str(), nullptr, 10);
+    	  if(!std::all_of(str_value.begin(), str_value.end(), ::isdigit)) {
+    		  std::cerr << "Error: option, " << option << ", needs an integer argument" << option << std::endl << std::endl;
+    		  return 0;
+    	  }
+    	  uint_value = strtol(str_value.c_str(), nullptr, 10);
       }
     }
     if(option == "-l") {
@@ -388,11 +556,11 @@ int main(int argc, char** argv) {
       size_t multi = 1;
       char last = str_value[str_value.length() - 1];
       if(last == 'K' || last == 'k') {
-	multi = 1 << 10;
+    	  multi = 1 << 10;
       } else if(last == 'M' || last == 'm') {
-	multi = 1 << 20;
+    	  multi = 1 << 20;
       } else if(last == 'G' || last == 'g') {
-	multi = 1 << 30;
+    	  multi = 1 << 30;
       }
       uint_value = strtol(str_value.c_str(), nullptr, 10);
       opt_memory = uint_value * multi;
@@ -404,6 +572,8 @@ int main(int argc, char** argv) {
       opt_verbose = true;
     } else if(option == "--sambamba") {
       opt_sambamba = true;
+    } else if(option == "-S" || option == "--SAM"){
+    	opt_sam = true;
     } else {
       std::cerr << "Error: unrecognized option, " << option << std::endl << std::endl;
       return 0;
@@ -431,17 +601,17 @@ int main(int argc, char** argv) {
       out_memory >>= 10;
       out_memory_suffix = 'K';
       if(out_memory > (1 << 14)) {
-	out_memory >>= 10;
-	out_memory_suffix = 'M';
-	if(out_memory > (1 << 14)) {
-	  out_memory >>= 10;
-	  out_memory_suffix = 'G';
-	}
+    	  out_memory >>= 10;
+    	  out_memory_suffix = 'M';
+    	  if(out_memory > (1 << 14)) {
+    		  out_memory >>= 10;
+    		  out_memory_suffix = 'G';
+    	  }
       }
     }
     std::cerr << "fast-samtools-sort is executed with the following options." << std::endl
-	      << " " << out_memory << out_memory_suffix << " memory" << std::endl
-	      << " " << opt_threads << (opt_threads == 1 ? " thread" : " threads") << std::endl;
+    		<< " " << out_memory << out_memory_suffix << " memory" << std::endl
+    		<< " " << opt_threads << (opt_threads == 1 ? " thread" : " threads") << std::endl;
   }
 
   {
