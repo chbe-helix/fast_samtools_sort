@@ -195,9 +195,6 @@ void thread_worker(void* vp) {
     thread_mutex.unlock();
     if(cur_block >= threadParam.num_block) break;
 
-    // DK - debugging purposes
-    std::cout << "cur block: " << cur_block << std::endl;
-
     std::vector<SamRecord> samRecords;
     // Read SAM file
     std::string cmd = "cat " + threadParam.fname_base + ".tmp." + std::to_string(cur_block);
@@ -237,10 +234,6 @@ void thread_worker(void* vp) {
 	field_num++;
       }
     }
-
-    // DK - debugging purposes
-    std::cout << "cur block: " << cur_block << "done" << std::endl;
-
 
 #if 0
     std::cout << "Number of sam records: " << samRecords.size() << std::endl;
