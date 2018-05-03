@@ -30,8 +30,6 @@
 #include <algorithm>
 #include <memory>
 #include <chrono>
-#include <sstream>
-
 #include "tinythread.h"
 
 // Program options
@@ -100,7 +98,6 @@ struct SamRecord_cmp {
   }
 };
 
-//CB additions ############################################
 // heap sort
 void makeHeap(std::vector<SamRecord>& array, int i, int n){
 	int largest = i;
@@ -133,41 +130,6 @@ void sortHeap(std::vector<SamRecord>& array){
 		makeHeap(array, 0, i);
 	}
 };
-
-// merge sort
-void merge(std::vector<SamRecord>& array, std::vector<SamRecord>& array1, std::vector<SamRecord>& array2){
-	array.clear();
-
-	size_t i, j;
-	for(i = 0, j = 0; i < array1.size() && j < array2.size(); ){
-		if(array1[i].pos <= array2[j].pos){
-			array.push_back(array1[i]);
-			i++;
-		} else if(array1[i].pos > array2[j].pos){
-			array.push_back(array2[j]);
-			j++;
-		}
-	}
-	while(i < array1.size()){
-		array.push_back(array1[i]);
-		i++;
-	}
-	while(j < array2.size()){
-		array.push_back(array2[j]);
-		j++;
-	}
-};
-
-void mergeSort(std::vector<SamRecord>& array){
-	if(1 < array.size()){
-		std::vector<SamRecord> array1(array.begin(), array.begin() + array.size() / 2);
-		mergeSort(array1);
-		std::vector<SamRecord> array2(array.begin() + array.size() / 2, array.end());
-		mergeSort(array2);
-		merge(array, array1, array2);
-	}
-};
-//end CB additions ###########################################
 
 static tthread::mutex thread_mutex;
 
@@ -384,8 +346,7 @@ int fast_samtools_sort(const std::string& in_fname,
     }
   }  
 
-  size_t sam_size = 0;
-  size_t file_num = 0;
+  size_t sam_size = 0, file_num = 1;
   for(size_t itr = 0; itr < table_size; itr++) {
     assert(sam_size <= opt_memory_per_thread);
     if(sam_size + table[itr] > opt_memory_per_thread) {
@@ -394,9 +355,8 @@ int fast_samtools_sort(const std::string& in_fname,
     } else {
       sam_size += table[itr];
     }
-    table[itr] = file_num;
+    table[itr] = file_num - 1;
   }
-  file_num++;
 
   std::ofstream vec_pipes[file_num];
   for(size_t itr = 0 ; itr < file_num ; itr++) {
