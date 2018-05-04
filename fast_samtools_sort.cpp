@@ -131,13 +131,47 @@ void sortHeap(std::vector<SamRecord>& array){
 	}
 };
 
+// Contig to position table that does use char* instead of std::string as key,
+//    thus avoiding numerous memory allocations/deallocations
+class Contig2Pos {
+public:
+  ~Contig2Pos() {
+    for(auto itr = _map.begin(); itr != _map.end(); itr++) {
+      assert(itr->first != nullptr);
+      delete []itr->first;
+    }
+  }
+  
+  void add(const char* str, size_t pos) {
+    assert(_map.find(str) == _map.end());
+    char* str_copy = new char[strlen(str) + 1];
+    strcpy(str_copy, str);
+    _map[str_copy] = pos;
+  }
+
+  size_t operator[](const char* str) {
+    assert(_map.find(str) != _map.end());
+    return _map[str];
+  }
+
+  struct Contig2PosCmp {
+    bool operator()(const char* str1, const char* str2) const {
+      return strcmp(str1, str2) < 0;
+    }
+  };
+	   
+private:
+  std::map<const char*, size_t, Contig2PosCmp> _map;
+};
+
+
 static tthread::mutex thread_mutex;
 
 struct ThreadParam {
   std::string fname_base;
   size_t* next_block;
   size_t num_block;
-  std::map<std::string, size_t>* contig2pos;
+  Contig2Pos* contig2pos;
   std::vector<std::string>* headers;
 
   size_t thread_id;
@@ -146,7 +180,7 @@ struct ThreadParam {
 
 void thread_worker(void* vp) {
   const ThreadParam& threadParam = *(ThreadParam*)vp;
-  std::map<std::string, size_t>& contig2pos = *threadParam.contig2pos;
+  Contig2Pos& contig2pos = *threadParam.contig2pos;
   std::vector<std::string>& headers = *threadParam.headers;
   size_t thread_id = threadParam.thread_id;
     
@@ -279,8 +313,8 @@ void thread_worker(void* vp) {
 
 int fast_samtools_sort(const std::string& in_fname,
 		       const std::string& out_fname) {
-  std::vector<SamRecord> samRecords;
-  std::map<std::string, size_t> contig2pos;
+  std::vector<std::string> headers;
+  Contig2Pos contig2pos;
 
   // Read BAM file
   std::string cmd = (opt_sambamba ? "sambamba" : "samtools");
@@ -291,12 +325,10 @@ int fast_samtools_sort(const std::string& in_fname,
   size_t size_sofar = 0;
   char buffer[2048], line[2048];
 
-  size_t* table = nullptr;
+  std::vector<size_t> table;
   const size_t interval = 1 << 10;
-  size_t table_size = 0;
 
   // First pass
-  std::vector<std::string> headers;
   {
     Timer t(std::cerr, "\t1st pass) Reading BAM/SAM file: " + cmd, opt_verbose);
     std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
@@ -314,10 +346,10 @@ int fast_samtools_sort(const std::string& in_fname,
     	  headers.push_back(buffer);
       } else {
 	strcpy(line, buffer);
-	if(table == nullptr) {
-	  table_size = (size_sofar + interval - 1) / interval + 1;
-	  table = new size_t[table_size];
-	  for(size_t i = 0; i < table_size; i++) {
+	if(table.size() == 0) {
+	  size_t table_size = (size_sofar + interval - 1) / interval + 1;
+	  table.resize(table_size);
+	  for(size_t i = 0; i < table.size(); i++) {
 	    table[i] = 0;
 	  }
 	};
@@ -338,7 +370,7 @@ int fast_samtools_sort(const std::string& in_fname,
 		throw std::runtime_error("");
 	      }
 	      contig_name = pch + 3;
-	      contig2pos[contig_name] = size_sofar;
+	      contig2pos.add(contig_name, size_sofar);
 	    } else if(field_num == 2) { // e.g. LN:107043718
 	      if(strlen(pch) <= 3) {
 		throw std::runtime_error("");
@@ -354,7 +386,7 @@ int fast_samtools_sort(const std::string& in_fname,
 	    contig_name = pch;
 	  } else if(field_num == 3) { // position
 	    if(contig_name[0] == '*') {
-	      table[table_size - 1] += (strlen(line) + 1);
+	      table[table.size() - 1] += (strlen(line) + 1);
 	    } else {
 	      size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
 	      table[(pos / interval)] += (strlen(line) + 1);
@@ -362,14 +394,14 @@ int fast_samtools_sort(const std::string& in_fname,
 	    break;
 	  }
 	}
-	pch = strtok(NULL, "\t");
+	pch = strtok(nullptr, "\t");
 	field_num++;
       }
     }
   }  
 
   size_t sam_size = 0, file_num = 1;
-  for(size_t itr = 0; itr < table_size; itr++) {
+  for(size_t itr = 0; itr < table.size(); itr++) {
     assert(sam_size <= opt_memory_per_thread);
     if(sam_size + table[itr] > opt_memory_per_thread) {
       sam_size = table[itr];
@@ -407,14 +439,14 @@ int fast_samtools_sort(const std::string& in_fname,
 	  contig_name = pch;
 	} else if(field_num == 3) { // position
 	  if(contig_name[0] == '*') {
-	    vec_pipes[table[table_size - 1]] << line;
+	    vec_pipes[table[table.size() - 1]] << line;
 	  } else {
 	    size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
 	    vec_pipes[table[(pos / interval)]] << line;
 	  }
 	  break;
 	}
-	pch = strtok(NULL, "\t");
+	pch = strtok(nullptr, "\t");
 	field_num++;
       }
     }
