@@ -177,12 +177,16 @@ struct ThreadParam {
   size_t num_block;
   std::map<std::string, size_t>* contig2pos;
   std::vector<std::string>* headers;
+
+  size_t thread_id;
+  size_t num_threads;
 };
 
 void thread_worker(void* vp) {
   const ThreadParam& threadParam = *(ThreadParam*)vp;
   std::map<std::string, size_t>& contig2pos = *threadParam.contig2pos;
   std::vector<std::string>& headers = *threadParam.headers;
+  size_t thread_id = threadParam.thread_id;
     
   char* sam = new char[opt_memory_per_thread];
   
@@ -192,10 +196,16 @@ void thread_worker(void* vp) {
     thread_mutex.lock();
     cur_block = *threadParam.next_block;
     *threadParam.next_block += 1;
+
+    if(opt_verbose) {
+      std::cerr << "Thread #" << thread_id << " is processing block #" << cur_block << "." << std::endl;
+    }
+    
     thread_mutex.unlock();
     if(cur_block >= threadParam.num_block) break;
 
     std::vector<SamRecord> samRecords;
+
     // Read SAM file
     std::string cmd = "cat " + threadParam.fname_base + ".tmp." + std::to_string(cur_block);
     std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
@@ -206,12 +216,14 @@ void thread_worker(void* vp) {
       buffer[0] = 0;
       if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
       if(strlen(buffer) == 0) continue;
+      assert(sam_cur + strlen(buffer) <= sam + opt_memory_per_thread);
       strcpy(sam_cur, buffer);
 
       // Split and parse fields
       int field_num = 0;
-      char* pch = strtok(buffer, "\t");
-      std::string contig_name = "";
+      char* pch_next = nullptr;
+      char* pch = strtok_r(buffer, "\t", &pch_next);
+      char* contig_name = nullptr;
       while(pch != nullptr) {
 	if(field_num == 2) { // chromosome or contig
 	  contig_name = pch;
@@ -230,19 +242,21 @@ void thread_worker(void* vp) {
 	  samRecords.push_back(samRecord);
 	  break;
 	}
-	pch = strtok(NULL, "\t");
+	pch = strtok_r(pch_next, "\t", &pch_next);
 	field_num++;
       }
     }
 
+    if(opt_verbose && thread_id == 0) {
 #if 0
-    std::cout << "Number of sam records: " << samRecords.size() << std::endl;
-    // Show the first 20 entries
-    for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
-      const SamRecord& samRecord = samRecords[i];
-      std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
-    }
+      std::cout << "Number of sam records: " << samRecords.size() << std::endl;
+      // Show the first 10 entries
+      for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
+	const SamRecord& samRecord = samRecords[i];
+	std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
+      }
 #endif
+    }
     
     // this is the field we need to change #########################
     // Sort
@@ -255,9 +269,9 @@ void thread_worker(void* vp) {
       //mergeSort(samRecords);
     }
     
-    if(opt_verbose) {
+    if(opt_verbose && thread_id == 0) {
 #if 0
-      // Show the first 20 entries
+      // Show the first 10 entries
       std::cout << std::endl << std::endl;
       std::cout << "After sorting:" << std::endl;
       for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
@@ -266,7 +280,7 @@ void thread_worker(void* vp) {
       }
 #endif
     }
-    
+
     // Write BAM file
     cmd = (opt_sambamba ? "sambamba" : "samtools");
     cmd += " view ";
@@ -452,11 +466,13 @@ int fast_samtools_sort(const std::string& in_fname,
     std::vector<tthread::thread*> threads(opt_threads);
     std::vector<ThreadParam> threadParams(opt_threads);
     for(size_t i = 0; i < opt_threads; i++) {
-      threadParams[i].fname_base = in_fname;
-      threadParams[i].next_block = &next_block;
-      threadParams[i].num_block = file_num;
-      threadParams[i].contig2pos = &contig2pos;
-      threadParams[i].headers = &headers;
+      threadParams[i].fname_base  = in_fname;
+      threadParams[i].next_block  = &next_block;
+      threadParams[i].num_block   = file_num;
+      threadParams[i].contig2pos  = &contig2pos;
+      threadParams[i].headers     = &headers;
+      threadParams[i].thread_id   = i;
+      threadParams[i].num_threads = opt_threads;
       threads[i] = new tthread::thread(thread_worker, (void*)&threadParams[i]);
     }
     
@@ -469,21 +485,18 @@ int fast_samtools_sort(const std::string& in_fname,
     }
   }
 
-  // DK - debugging purposes
-  return 0;
-
   // Concatenate BAM blocks
   {
-    Timer t(std::cerr, "\tConcatenating BAM blocks: ", opt_verbose);
     std::string cmd = (opt_sambamba ? "sambamba" : "samtools");
-    cmd += " cat -h ";
-    // cmd += header_fname;
-    cmd += " -o ";
-    // cmd += out_fname;
-    // cmd += in_fnames;
-    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-    if(!pipe) throw std::runtime_error("popen() failed!");
-    while(!feof(pipe.get())) {
+    cmd += " cat -o ";
+    cmd += out_fname;
+    for(size_t i = 0; i < file_num; i++) {
+      cmd += (" " + in_fname + ".tmp.sorted." + std::to_string(i));
+    }
+    Timer t(std::cerr, "\tConcatenating BAM blocks: " + cmd, opt_verbose);
+    int return_value = system(cmd.c_str());
+    if(return_value != 0) {
+      std::cerr << "BAM concatenation failed." << "\n\t" << cmd << std::endl;
     }
   }
 
