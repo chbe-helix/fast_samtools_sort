@@ -347,12 +347,10 @@ int fast_samtools_sort(const std::string& in_fname,
 	  if(field_num == 2) { // chromosome or contig
 	    contig_name = pch;
 	  } else if(field_num == 3) { // position
-	    size_t pos = 0;
 	    if(contig_name[0] == '*') {
-	      pos = std::numeric_limits<size_t>::max();
 	      table[table_size - 1] += (strlen(line) + 1);
 	    } else {
-	      pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+	      size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
 	      table[(pos / interval)] += (strlen(line) + 1);
 	    }
 	    break;
@@ -375,17 +373,16 @@ int fast_samtools_sort(const std::string& in_fname,
     }
     table[itr] = file_num - 1;
   }
-
-  std::ofstream vec_pipes[file_num];
-  for(size_t itr = 0 ; itr < file_num ; itr++) {
-    std::string fname = in_fname + ".tmp.";
-    fname += std::to_string(itr);
-    vec_pipes[itr].open(fname);
-  }
   
   // Second pass
   {
     Timer t(std::cerr, "\t2nd pass) Reading BAM/SAM file: " + cmd, opt_verbose);
+    std::ofstream vec_pipes[file_num];
+    for(size_t i = 0; i < file_num; i++) {
+      std::string fname = in_fname + ".tmp." + std::to_string(i);
+      vec_pipes[i].open(fname);
+    }
+  
     std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
     if(!pipe) throw std::runtime_error("popen() failed!");
     while(!feof(pipe.get())) {
@@ -403,12 +400,10 @@ int fast_samtools_sort(const std::string& in_fname,
 	if(field_num == 2) { // chromosome or contig
 	  contig_name = pch;
 	} else if(field_num == 3) { // position
-	  size_t pos = 0;
 	  if(contig_name[0] == '*') {
-	    pos = std::numeric_limits<size_t>::max();
 	    vec_pipes[table[table_size - 1]] << line;
 	  } else {
-	    pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+	    size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
 	    vec_pipes[table[(pos / interval)]] << line;
 	  }
 	  break;
@@ -417,12 +412,12 @@ int fast_samtools_sort(const std::string& in_fname,
 	field_num++;
       }
     }
+
+    for(size_t i = 0; i < file_num; i++) {
+      vec_pipes[i].close();
+    }
   }
   
-  for(size_t itr = 0 ; itr < file_num ; itr++) {
-    vec_pipes[itr].close();
-  }
-
   // Sort blocks using multiple threads
   size_t next_block = 0;
   {
@@ -595,10 +590,10 @@ int main(int argc, char** argv) {
     		<< " " << out_memory << out_memory_suffix << " memory" << std::endl
     		<< " " << opt_threads << (opt_threads == 1 ? " thread" : " threads") << std::endl;
 
-    std::cerr << "\tEquivalent samtools' command: time samtools sort --threads " << opt_threads
+    std::cerr << "\tEquivalent samtools command: time samtools sort --threads " << opt_threads
 	      << " -m " << opt_memory_per_thread << " " << opt_infname
 	      << " -o " << opt_outfname << std::endl;
-    std::cerr << "\t           sambamba' command: time sambamba sort --nthreads " << opt_threads
+    std::cerr << "\t           sambamba command: time sambamba sort --nthreads " << opt_threads
 	      << " -m " << opt_memory << " " << opt_infname
 	      << " -o " << opt_outfname << std::endl;
   }
