@@ -169,7 +169,8 @@ void thread_worker(void* vp) {
     std::vector<SamRecord> samRecords;
 
     // Read SAM file
-    std::string cmd = "cat " + threadParam.fname_base + ".tmp." + std::to_string(cur_block);
+    std::string in_fname = threadParam.fname_base + ".tmp." + std::to_string(cur_block);
+    std::string cmd = "cat " + in_fname;
     std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
     if(!pipe) throw std::runtime_error("popen() failed!");
     char buffer[2048];
@@ -208,6 +209,9 @@ void thread_worker(void* vp) {
 	field_num++;
       }
     }
+
+    // Remove the input file
+    remove(in_fname.c_str());
 
     if(opt_verbose && thread_id == 0) {
 #if 0
@@ -316,7 +320,7 @@ int fast_samtools_sort(const std::string& in_fname,
       // Split and parse fields
       int field_num = 0;
       char* pch = strtok(buffer, "\t");
-      std::string contig_name = "";
+      char* contig_name = nullptr;
       while(pch != nullptr) {
 	if(header) {
 	  if(field_num == 0) {
@@ -327,14 +331,14 @@ int fast_samtools_sort(const std::string& in_fname,
 	      if(strlen(pch) <= 3) {
 		throw std::runtime_error("");
 	      }
-	      std::string contig_name = pch + 3;
+	      contig_name = pch + 3;
 	      contig2pos[contig_name] = size_sofar;
 	    } else if(field_num == 2) { // e.g. LN:107043718
 	      if(strlen(pch) <= 3) {
 		throw std::runtime_error("");
 	      }
 	      char* end;
-	      size_t contig_len = strtol(pch + 3, &end, 10); //was atoi(pch + 3)
+	      size_t contig_len = strtol(pch + 3, &end, 10);
 	      size_sofar += contig_len;
 	      break;
 	    }
@@ -394,7 +398,7 @@ int fast_samtools_sort(const std::string& in_fname,
       // Split and parse fields
       int field_num = 0;
       char* pch = strtok(buffer, "\t");
-      std::string contig_name = "";
+      char* contig_name = nullptr;
       while(pch != nullptr) {
 	if(field_num == 2) { // chromosome or contig
 	  contig_name = pch;
@@ -445,18 +449,32 @@ int fast_samtools_sort(const std::string& in_fname,
     }
   }
 
-  // Concatenate BAM blocks
+  // DK -> CB todo
+  // the number of unalined reads is usually very large, perhaps over hundreds of millions
+  //   and there is no need to sort unaligned reads.
+  // thus, we may want to write unalinged reads directly into a BAM file using multiple threads
   {
-    std::string cmd = (opt_sambamba ? "sambamba" : "samtools");
-    cmd += " cat -o ";
-    cmd += out_fname;
+    Timer t(std::cerr, "\tWriting unaligned reads: ", opt_verbose);
+  }
+
+  // Use samtools's cat to concatenate BAM blocks
+  //  Note: sambamba hasn't implemented "cat" function
+  {
+    std::string cmd = "samtools cat -o " + out_fname;
+    std::vector<std::string> block_fnames;
     for(size_t i = 0; i < file_num; i++) {
-      cmd += (" " + in_fname + ".tmp.sorted." + std::to_string(i));
+      std::string block_fname = in_fname + ".tmp.sorted." + std::to_string(i);
+      block_fnames.push_back(block_fname);
+      cmd += (" " + block_fname);
     }
     Timer t(std::cerr, "\tConcatenating BAM blocks: " + cmd, opt_verbose);
     int return_value = system(cmd.c_str());
     if(return_value != 0) {
       std::cerr << "BAM concatenation failed." << "\n\t" << cmd << std::endl;
+    }
+    // Remove block BAM files
+    for(size_t i = 0; i < block_fnames.size(); i++) {
+      remove(block_fnames[i].c_str());
     }
   }
 
@@ -576,6 +594,13 @@ int main(int argc, char** argv) {
     std::cerr << "fast-samtools-sort is executed with the following options." << std::endl
     		<< " " << out_memory << out_memory_suffix << " memory" << std::endl
     		<< " " << opt_threads << (opt_threads == 1 ? " thread" : " threads") << std::endl;
+
+    std::cerr << "\tEquivalent samtools' command: time samtools sort --threads " << opt_threads
+	      << " -m " << opt_memory_per_thread << " " << opt_infname
+	      << " -o " << opt_outfname << std::endl;
+    std::cerr << "\t           sambamba' command: time sambamba sort --nthreads " << opt_threads
+	      << " -m " << opt_memory << " " << opt_infname
+	      << " -o " << opt_outfname << std::endl;
   }
 
   {
