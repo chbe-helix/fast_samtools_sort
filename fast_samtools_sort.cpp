@@ -165,48 +165,51 @@ void thread_worker(void* vp) {
     
     thread_mutex.unlock();
     if(cur_block >= threadParam.num_block) break;
-
+    
     std::vector<SamRecord> samRecords;
-
-    // Read SAM file
     std::string in_fname = threadParam.fname_base + ".tmp." + std::to_string(cur_block);
     std::string cmd = "cat " + in_fname;
-    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-    if(!pipe) throw std::runtime_error("popen() failed!");
-    char buffer[2048];
-    char* sam_cur = sam;
-    while(!feof(pipe.get())) {
-      buffer[0] = 0;
-      if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
-      if(strlen(buffer) == 0) continue;
-      assert(sam_cur + strlen(buffer) <= sam + opt_memory_per_thread);
-      strcpy(sam_cur, buffer);
-
-      // Split and parse fields
-      int field_num = 0;
-      char* pch_next = nullptr;
-      char* pch = strtok_r(buffer, "\t", &pch_next);
-      char* contig_name = nullptr;
-      while(pch != nullptr) {
-	if(field_num == 2) { // chromosome or contig
-	  contig_name = pch;
-	} else if(field_num == 3) { // position
-	  SamRecord samRecord;
-	  samRecord.read_id = samRecords.size();
-	  if(contig_name[0] == '*') {
-	    samRecord.pos = std::numeric_limits<size_t>::max();
-	    // table[table_size - 1] += strlen(sam_cur);
-	  } else {
-	    samRecord.pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
-	    // table[(samRecord.pos / interval) + 1] += strlen(sam_cur);
+    {
+      Timer t(std::cerr, "\tThread #0 reading SAM", opt_verbose && thread_id == 0);
+          
+      // Read SAM file
+      std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+      if(!pipe) throw std::runtime_error("popen() failed!");
+      char buffer[2048];
+      char* sam_cur = sam;
+      while(!feof(pipe.get())) {
+	buffer[0] = 0;
+	if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
+	if(strlen(buffer) == 0) continue;
+	assert(sam_cur + strlen(buffer) <= sam + opt_memory_per_thread);
+	strcpy(sam_cur, buffer);
+	
+	// Split and parse fields
+	int field_num = 0;
+	char* pch_next = nullptr;
+	char* pch = strtok_r(buffer, "\t", &pch_next);
+	char* contig_name = nullptr;
+	while(pch != nullptr) {
+	  if(field_num == 2) { // chromosome or contig
+	    contig_name = pch;
+	  } else if(field_num == 3) { // position
+	    SamRecord samRecord;
+	    samRecord.read_id = samRecords.size();
+	    if(contig_name[0] == '*') {
+	      samRecord.pos = std::numeric_limits<size_t>::max();
+	      // table[table_size - 1] += strlen(sam_cur);
+	    } else {
+	      samRecord.pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+	      // table[(samRecord.pos / interval) + 1] += strlen(sam_cur);
+	    }
+	    samRecord.line = sam_cur;
+	    sam_cur += (strlen(sam_cur) + 1);
+	    samRecords.push_back(samRecord);
+	    break;
 	  }
-	  samRecord.line = sam_cur;
-	  sam_cur += (strlen(sam_cur) + 1);
-	  samRecords.push_back(samRecord);
-	  break;
+	  pch = strtok_r(pch_next, "\t", &pch_next);
+	  field_num++;
 	}
-	pch = strtok_r(pch_next, "\t", &pch_next);
-	field_num++;
       }
     }
 
@@ -227,7 +230,7 @@ void thread_worker(void* vp) {
     // this is the field we need to change #########################
     // Sort
     {
-      // Timer t(std::cerr, "\tSorting", opt_verbose);
+      Timer t(std::cerr, "\tThread #0 sorting", opt_verbose && thread_id == 0);
       std::sort(samRecords.begin(), samRecords.end(), SamRecord_cmp());
       //std::make_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
       //std::sort_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
@@ -248,23 +251,26 @@ void thread_worker(void* vp) {
     }
 
     // Write BAM file
-    cmd = (opt_sambamba ? "sambamba" : "samtools");
-    cmd += " view ";
-    if(opt_sambamba) {
-      cmd += " -f bam -S /dev/stdin -o ";
-    } else {
-      cmd += " -bS - > ";
-    }
-    cmd = cmd + threadParam.fname_base + ".tmp.sorted." + std::to_string(cur_block);
-    
-    std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
-    if(!pipe2) throw std::runtime_error("popen() failed!");
-    for(size_t i = 0; i < headers.size(); i++) {
-      fputs(headers[i].c_str(), pipe2.get());
-    }
-    for(size_t i = 0; i < samRecords.size(); i++) {
-      const SamRecord& samRecord = samRecords[i];
-      fputs(samRecord.line, pipe2.get());
+    {
+      Timer t(std::cerr, "\tThread #0 writing into BAM", opt_verbose && thread_id == 0);
+      cmd = (opt_sambamba ? "sambamba" : "samtools");
+      cmd += " view ";
+      if(opt_sambamba) {
+	cmd += " -f bam -S /dev/stdin -o ";
+      } else {
+	cmd += " -bS - > ";
+      }
+      cmd = cmd + threadParam.fname_base + ".tmp.sorted." + std::to_string(cur_block);
+      
+      std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
+      if(!pipe2) throw std::runtime_error("popen() failed!");
+      for(size_t i = 0; i < headers.size(); i++) {
+	fputs(headers[i].c_str(), pipe2.get());
+      }
+      for(size_t i = 0; i < samRecords.size(); i++) {
+	const SamRecord& samRecord = samRecords[i];
+	fputs(samRecord.line, pipe2.get());
+      }
     }
   }
   
