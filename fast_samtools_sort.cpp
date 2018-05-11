@@ -91,44 +91,21 @@ struct SamRecord {
   char* line;
 };
 
+struct fileLines {
+	size_t numLines = 0;
+	bool bypass = 0;
+};
+
+struct table_records {
+	size_t num_lines;
+	size_t num_char;
+};
+
 struct SamRecord_cmp {
   bool operator() (const SamRecord& a, const SamRecord& b) const {
     if(a.pos != b.pos) return a.pos < b.pos;
     return a.read_id < b.read_id; // Preserve reads
   }
-};
-
-// heap sort
-void makeHeap(std::vector<SamRecord>& array, int i, int n){
-	int largest = i;
-	int l = 2*i + 1;
-	int r = 2*i + 2;
-
-	if(l < n && array[l].pos > array[largest].pos){
-		largest = l;
-	}
-
-	if(r < n && array[r].pos > array[largest].pos){
-		largest = r;
-	}
-
-	if(largest != i){
-		std::swap(array[i], array[largest]);
-		makeHeap(array, largest, n);
-	}
-};
-
-void sortHeap(std::vector<SamRecord>& array){
-	int n = array.size();
-
-	for (int i = n/2; i >= 1; i--){
-		makeHeap(array, i, n);
-	}
-
-	for (int i = n-1; i >= 0; i--){
-		std::swap(array[0], array[i]);
-		makeHeap(array, 0, i);
-	}
 };
 
 // Contig to position table that does use char* instead of std::string as key,
@@ -164,7 +141,6 @@ private:
   std::map<const char*, size_t, Contig2PosCmp> _map;
 };
 
-
 static tthread::mutex thread_mutex;
 
 struct ThreadParam {
@@ -173,9 +149,140 @@ struct ThreadParam {
   size_t num_block;
   Contig2Pos* contig2pos;
   std::vector<std::string>* headers;
+  std::vector<fileLines>* file_lines;
 
   size_t thread_id;
   size_t num_threads;
+};
+
+// CB todo clean code
+
+void fieldSplitter(int &pass,
+	std::vector<table_records> *table,
+	size_t *table_size,
+	std::vector<std::string> &headers,
+	Contig2Pos &contig2pos,
+	std::string &cmd,
+	size_t *aligned_file_num,
+	std::ofstream* vec_pipes = nullptr,
+	std::vector<SamRecord>* samRecords = nullptr,
+	char* sam_cur = nullptr){
+
+	char buffer[2048];
+	char line[2048];
+	size_t size_sofar = 0;
+	size_t unalign_itr = 0;
+	const size_t interval = 1 << 10;
+
+	std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+	if(!pipe) throw std::runtime_error("popen() failed!");
+	while(!feof(pipe.get())) {
+		buffer[0] = 0;
+		if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
+		if(strlen(buffer) == 0) continue;
+
+		if (pass == 2){
+			if(buffer[0] == '@') continue;
+			strcpy(line, buffer);
+		} else if (pass == 3){
+			strcpy(sam_cur, buffer);
+		}
+
+		// Is the current line header?
+		bool header = (buffer[0] == '@');
+		// Is the current line sequence info?
+		bool sequence = false;
+		if(header && pass == 1) {
+			headers.push_back(buffer);
+		} else if (pass == 1){
+			strcpy(line, buffer);
+			if(table->size() == 0) {
+				*table_size = (size_sofar + interval - 1) / interval + 1;
+				table->resize(*table_size);
+				table->reserve(*table_size + 10); // Added 10 here to keep from reallocating memory if the table grows due to unaligned reads
+				for(size_t i = 0; i < table->size(); i++) {
+					(*table)[i].num_char = 0;
+	  				(*table)[i].num_lines = 0;
+					}
+				};
+	 		}
+
+		// Split and parse fields
+		int field_num = 0;
+		char* pch_next = nullptr;
+		char* pch = strtok_r(buffer, "\t", &pch_next);
+		char* contig_name = nullptr;
+		while(pch != nullptr) {
+			if(header && pass == 1) {
+				if(field_num == 0) {
+					sequence = (strcmp(pch, "@SQ") == 0);
+				}
+				if(sequence) {
+					if(field_num == 1) { // e.g. SN:14
+						if(strlen(pch) <= 3) {
+							throw std::runtime_error("");
+						}
+					contig_name = pch + 3;
+					contig2pos.add(contig_name, size_sofar);
+					} else if(field_num == 2) { // e.g. LN:107043718
+						if(strlen(pch) <= 3) {
+							throw std::runtime_error("");
+						}
+						char* end;
+						size_t contig_len = strtol(pch + 3, &end, 10);
+						size_sofar += contig_len;
+						break;
+					}
+				}
+			} else {
+				if(field_num == 2) { // chromosome or contig
+					contig_name = pch;
+				} else if(field_num == 3 && pass == 1) { // position
+					if(contig_name[0] == '*') {
+						if(((*table)[table->size() - 1].num_char + (strlen(line) + 1)) > opt_memory_per_thread){
+							table_records tbl;
+							tbl.num_char = 0;
+							tbl.num_lines = 0;
+							table->push_back(tbl);
+						}
+						(*table)[table->size() - 1].num_char += (strlen(line) + 1);
+						(*table)[table->size() - 1].num_lines++;
+					} else {
+						size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+						(*table)[(pos / interval)].num_char += (strlen(line) + 1);
+						(*table)[(pos / interval)].num_lines++;
+					}
+					break;
+				} else if(field_num == 3 && pass == 2) { // position
+					if(contig_name[0] == '*') {
+						if((*table)[*table_size - 1 + unalign_itr].num_lines == 0){
+							unalign_itr++;
+						}
+						vec_pipes[*aligned_file_num + unalign_itr] << line;
+						(*table)[*table_size - 1 + unalign_itr].num_lines--;
+					} else {
+						size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+						vec_pipes[(*table)[(pos / interval)].num_char] << line;
+					}
+					break;
+				} else if(field_num == 3 && pass == 3) { // position
+					SamRecord samRecord;
+					samRecord.read_id = samRecords->size();
+					if(contig_name[0] == '*') {
+						samRecord.pos = std::numeric_limits<size_t>::max();
+					} else {
+						samRecord.pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
+					}
+					samRecord.line = sam_cur;
+					sam_cur += (strlen(sam_cur) + 1);
+					samRecords->push_back(samRecord);
+					break;
+				}
+			}
+			pch = strtok_r(pch_next, "\t", &pch_next);
+			field_num++;
+		}
+	}
 };
 
 void thread_worker(void* vp) {
@@ -183,6 +290,7 @@ void thread_worker(void* vp) {
   Contig2Pos& contig2pos = *threadParam.contig2pos;
   std::vector<std::string>& headers = *threadParam.headers;
   size_t thread_id = threadParam.thread_id;
+  std::vector<fileLines>& arrFileLines = *threadParam.file_lines;
     
   char* sam = new char[opt_memory_per_thread];
   
@@ -199,219 +307,171 @@ void thread_worker(void* vp) {
     
     thread_mutex.unlock();
     if(cur_block >= threadParam.num_block) break;
-    
-    std::vector<SamRecord> samRecords;
+
     std::string in_fname = threadParam.fname_base + ".tmp." + std::to_string(cur_block);
     std::string cmd = "cat " + in_fname;
-    {
-      Timer t(std::cerr, "\tThread #0 reading SAM", opt_verbose && thread_id == 0);
-          
-      // Read SAM file
-      std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-      if(!pipe) throw std::runtime_error("popen() failed!");
-      char buffer[2048];
-      char* sam_cur = sam;
-      while(!feof(pipe.get())) {
-	buffer[0] = 0;
-	if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
-	if(strlen(buffer) == 0) continue;
-	assert(sam_cur + strlen(buffer) <= sam + opt_memory_per_thread);
-	strcpy(sam_cur, buffer);
-	
-	// Split and parse fields
-	int field_num = 0;
-	char* pch_next = nullptr;
-	char* pch = strtok_r(buffer, "\t", &pch_next);
-	char* contig_name = nullptr;
-	while(pch != nullptr) {
-	  if(field_num == 2) { // chromosome or contig
-	    contig_name = pch;
-	  } else if(field_num == 3) { // position
-	    SamRecord samRecord;
-	    samRecord.read_id = samRecords.size();
-	    if(contig_name[0] == '*') {
-	      samRecord.pos = std::numeric_limits<size_t>::max();
-	      // table[table_size - 1] += strlen(sam_cur);
-	    } else {
-	      samRecord.pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
-	      // table[(samRecord.pos / interval) + 1] += strlen(sam_cur);
-	    }
-	    samRecord.line = sam_cur;
-	    sam_cur += (strlen(sam_cur) + 1);
-	    samRecords.push_back(samRecord);
-	    break;
-	  }
-	  pch = strtok_r(pch_next, "\t", &pch_next);
-	  field_num++;
-	}
-      }
-    }
 
-    // Remove the input file
-    remove(in_fname.c_str());
+    // CB todo get bucket sort going here
+    if(!arrFileLines[cur_block].bypass){
+    	std::vector<SamRecord> samRecords;
+    	samRecords.reserve(arrFileLines[cur_block].numLines);
+    	{
+    		Timer t(std::cerr, "\tThread #0 reading SAM", opt_verbose && thread_id == 0);
 
-    if(opt_verbose && thread_id == 0) {
-#if 0
-      std::cout << "Number of sam records: " << samRecords.size() << std::endl;
-      // Show the first 10 entries
-      for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
-	const SamRecord& samRecord = samRecords[i];
-	std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
-      }
-#endif
-    }
-    
-    // this is the field we need to change #########################
-    // Sort
-    {
-      Timer t(std::cerr, "\tThread #0 sorting", opt_verbose && thread_id == 0);
-      std::sort(samRecords.begin(), samRecords.end(), SamRecord_cmp());
-      //std::make_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
-      //std::sort_heap(samRecords.begin(), samRecords.end(), SamRecord_cmp());
-      //sortHeap(samRecords);
-      //mergeSort(samRecords);
-    }
-    
-    if(opt_verbose && thread_id == 0) {
-#if 0
-      // Show the first 10 entries
-      std::cout << std::endl << std::endl;
-      std::cout << "After sorting:" << std::endl;
-      for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
-	const SamRecord& samRecord = samRecords[i];
-	std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
-      }
-#endif
-    }
+    		// Read SAM file
+    	    int pass = 3;
+    	    fieldSplitter(pass,
+    	    		nullptr,
+    	    		nullptr,
+    	    		headers,
+    	    		contig2pos,
+    	    		cmd,
+    	    		nullptr,
+    	    		nullptr,
+    	    		&samRecords,
+    	    		sam);
+    	}
 
-    // Write BAM file
+    	remove(in_fname.c_str()); // Remove the input file
+
+    	if(opt_verbose && thread_id == 0) {
+    		#if 0
+    		std::cout << "Number of sam records: " << samRecords.size() << std::endl;
+    		// Show the first 10 entries
+    		for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
+    			const SamRecord& samRecord = samRecords[i];
+    			std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
+    		}
+    		#endif
+    		}
+    	// Sort
+    	{
+    		Timer t(std::cerr, "\tThread #0 sorting", opt_verbose && thread_id == 0);
+    		std::sort(samRecords.begin(), samRecords.end(), SamRecord_cmp());
+    	}
+    	if(opt_verbose && thread_id == 0) {
+    		#if 0
+    		// Show the first 10 entries
+    		std::cout << std::endl << std::endl;
+    		std::cout << "After sorting:" << std::endl;
+    		for(size_t i = 0; i < std::min<size_t>(10, samRecords.size()); i++) {
+    			const SamRecord& samRecord = samRecords[i];
+    			std::cout << "ReadID: " << samRecord.read_id << " Pos: " << samRecord.pos << "\t" << samRecord.line;
+    		}
+    		#endif
+    		}
+    	// Write BAM file aligned
+    	{
+    		Timer t(std::cerr, "\tThread #0 writing into BAM", opt_verbose && thread_id == 0);
+    		cmd = (opt_sambamba ? "sambamba" : "samtools");
+    		cmd += " view ";
+    		if(opt_sambamba) {
+    			cmd += " -f bam -S /dev/stdin -o ";
+    		} else {
+    			cmd += " -bS - > ";
+    		}
+    		cmd = cmd + threadParam.fname_base + ".tmp.sorted." + std::to_string(cur_block);
+    		std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
+    		if(!pipe2) throw std::runtime_error("popen() failed!");
+    		for(size_t i = 0; i < headers.size(); i++) {
+    			fputs(headers[i].c_str(), pipe2.get());
+    		}
+    		for(size_t i = 0; i < samRecords.size(); i++) {
+    			const SamRecord& samRecord = samRecords[i];
+    			fputs(samRecord.line, pipe2.get());
+    		}
+    	}
+
+    } else if(arrFileLines[cur_block].bypass)
+    // Write BAM file unaligned
     {
-      Timer t(std::cerr, "\tThread #0 writing into BAM", opt_verbose && thread_id == 0);
-      cmd = (opt_sambamba ? "sambamba" : "samtools");
-      cmd += " view ";
-      if(opt_sambamba) {
-	cmd += " -f bam -S /dev/stdin -o ";
-      } else {
-	cmd += " -bS - > ";
-      }
-      cmd = cmd + threadParam.fname_base + ".tmp.sorted." + std::to_string(cur_block);
-      
-      std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
-      if(!pipe2) throw std::runtime_error("popen() failed!");
-      for(size_t i = 0; i < headers.size(); i++) {
-	fputs(headers[i].c_str(), pipe2.get());
-      }
-      for(size_t i = 0; i < samRecords.size(); i++) {
-	const SamRecord& samRecord = samRecords[i];
-	fputs(samRecord.line, pipe2.get());
-      }
+    	{
+    		Timer t(std::cerr, "\tWriting unaligned reads: ", opt_verbose && thread_id == 0);
+    	    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+    	    if(!pipe) throw std::runtime_error("popen() failed!");
+    	    char buffer[2048];
+
+    	    cmd = (opt_sambamba ? "sambamba" : "samtools");
+    		cmd += " view ";
+    		if(opt_sambamba) {
+    			cmd += " -f bam -S /dev/stdin -o ";
+    		} else {
+    			cmd += " -bS - > ";
+    		}
+    		cmd = cmd + threadParam.fname_base + ".tmp.sorted." + std::to_string(cur_block);
+    		std::shared_ptr<FILE> pipe2(popen(cmd.c_str(), "w"), pclose);
+    		if(!pipe2) throw std::runtime_error("popen() failed!");
+    		for(size_t i = 0; i < headers.size(); i++) {
+    			fputs(headers[i].c_str(), pipe2.get());
+    		}
+    		while(!feof(pipe.get())) {
+    		   	buffer[0] = 0;
+    		   	if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
+    		   	if(strlen(buffer) == 0) continue;
+    			fputs(buffer, pipe2.get());
+    		}
+    	}
+    	remove(in_fname.c_str());
     }
   }
-  
   delete []sam;
 }
 
-int fast_samtools_sort(const std::string& in_fname,
-		       const std::string& out_fname) {
+int fast_samtools_sort(const std::string& in_fname, const std::string& out_fname) {
   std::vector<std::string> headers;
   Contig2Pos contig2pos;
-
-  // Read BAM file
+  std::vector<table_records> table;
+  size_t table_size = 0;
+  size_t aligned_file_num = 0;
   std::string cmd = (opt_sambamba ? "sambamba" : "samtools");
   cmd += (opt_sam && opt_sambamba ? " view -h -S " : " view -h ");
   cmd += (opt_sambamba ? "--nthreads " : "--threads ");
   cmd += std::to_string(opt_threads) + " ";
   cmd += in_fname;
-  size_t size_sofar = 0;
-  char buffer[2048], line[2048];
 
-  std::vector<size_t> table;
-  const size_t interval = 1 << 10;
-
+  int pass = 1;
+  // Read BAM file
   // First pass
   {
     Timer t(std::cerr, "\t1st pass) Reading BAM/SAM file: " + cmd, opt_verbose);
-    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-    if(!pipe) throw std::runtime_error("popen() failed!");
-    while(!feof(pipe.get())) {
-      buffer[0] = 0;
-      if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
-      if(strlen(buffer) == 0) continue;
-      
-      // Is the current line header?
-      bool header = (buffer[0] == '@');
-      // Is the current line sequence info?
-      bool sequence = false;
-      if(header) {
-    	  headers.push_back(buffer);
-      } else {
-	strcpy(line, buffer);
-	if(table.size() == 0) {
-	  size_t table_size = (size_sofar + interval - 1) / interval + 1;
-	  table.resize(table_size);
-	  for(size_t i = 0; i < table.size(); i++) {
-	    table[i] = 0;
-	  }
-	};
-      }
-      
-      // Split and parse fields
-      int field_num = 0;
-      char* pch = strtok(buffer, "\t");
-      char* contig_name = nullptr;
-      while(pch != nullptr) {
-	if(header) {
-	  if(field_num == 0) {
-	    sequence = (strcmp(pch, "@SQ") == 0);
-	  }
-	  if(sequence) {
-	    if(field_num == 1) { // e.g. SN:14
-	      if(strlen(pch) <= 3) {
-		throw std::runtime_error("");
-	      }
-	      contig_name = pch + 3;
-	      contig2pos.add(contig_name, size_sofar);
-	    } else if(field_num == 2) { // e.g. LN:107043718
-	      if(strlen(pch) <= 3) {
-		throw std::runtime_error("");
-	      }
-	      char* end;
-	      size_t contig_len = strtol(pch + 3, &end, 10);
-	      size_sofar += contig_len;
-	      break;
-	    }
-	  }
-	} else {
-	  if(field_num == 2) { // chromosome or contig
-	    contig_name = pch;
-	  } else if(field_num == 3) { // position
-	    if(contig_name[0] == '*') {
-	      table[table.size() - 1] += (strlen(line) + 1);
-	    } else {
-	      size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
-	      table[(pos / interval)] += (strlen(line) + 1);
-	    }
-	    break;
-	  }
-	}
-	pch = strtok(nullptr, "\t");
-	field_num++;
-      }
-    }
+
+    fieldSplitter(pass,
+    		&table,
+    		&table_size,
+    		headers,
+    		contig2pos,
+    		cmd,
+    		&aligned_file_num
+    		);
   }  
 
+  // Determine number of files and lines per file
   size_t sam_size = 0, file_num = 1;
-  for(size_t itr = 0; itr < table.size(); itr++) {
+  fileLines lines_per_file;
+  std::vector<fileLines> arrFileLines;
+  assert(table_size != 0);
+  for(size_t itr = 0; itr < (table_size - 1); itr++) {
     assert(sam_size <= opt_memory_per_thread);
-    if(sam_size + table[itr] > opt_memory_per_thread) {
-      sam_size = table[itr];
+    if(sam_size + table[itr].num_char > opt_memory_per_thread) {
+      arrFileLines.push_back(lines_per_file);
       file_num++;
+      sam_size = table[itr].num_char;
+      lines_per_file.numLines = table[itr].num_lines;
     } else {
-      sam_size += table[itr];
+      sam_size += table[itr].num_char;
+      lines_per_file.numLines += table[itr].num_lines;
     }
-    table[itr] = file_num - 1;
+    table[itr].num_char = file_num - 1;
   }
-  
+  arrFileLines.push_back(lines_per_file);
+  aligned_file_num = file_num;
+  file_num += (table.size() - (table_size - 1));
+  for(size_t itr = (table_size - 1); itr < table.size(); itr++){
+	  lines_per_file.numLines = table[itr].num_lines;
+	  lines_per_file.bypass = 1;
+	  arrFileLines.push_back(lines_per_file);
+  }
+
   // Second pass
   {
     Timer t(std::cerr, "\t2nd pass) Reading BAM/SAM file: " + cmd, opt_verbose);
@@ -420,44 +480,24 @@ int fast_samtools_sort(const std::string& in_fname,
       std::string fname = in_fname + ".tmp." + std::to_string(i);
       vec_pipes[i].open(fname);
     }
-  
-    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-    if(!pipe) throw std::runtime_error("popen() failed!");
-    while(!feof(pipe.get())) {
-      buffer[0] = 0;
-      if(fgets(buffer, sizeof(buffer), pipe.get()) == nullptr) break;
-      if(strlen(buffer) == 0) continue;
-      if(buffer[0] == '@') continue;
-      strcpy(line, buffer);
 
-      // Split and parse fields
-      int field_num = 0;
-      char* pch = strtok(buffer, "\t");
-      char* contig_name = nullptr;
-      while(pch != nullptr) {
-	if(field_num == 2) { // chromosome or contig
-	  contig_name = pch;
-	} else if(field_num == 3) { // position
-	  if(contig_name[0] == '*') {
-	    vec_pipes[table[table.size() - 1]] << line;
-	  } else {
-	    size_t pos = contig2pos[contig_name] + strtol(pch, nullptr, 10);
-	    vec_pipes[table[(pos / interval)]] << line;
-	  }
-	  break;
-	}
-	pch = strtok(nullptr, "\t");
-	field_num++;
-      }
-    }
+    pass = 2;
+    fieldSplitter(pass,
+    		&table,
+    		&table_size,
+    		headers,
+    		contig2pos,
+    		cmd,
+    		&aligned_file_num,
+    		vec_pipes);
 
     for(size_t i = 0; i < file_num; i++) {
       vec_pipes[i].close();
     }
   }
-  
+
   // Sort blocks using multiple threads
-  size_t next_block = 0;
+  size_t next_block = 0; // will need to change this number to reflect the new unaligned files
   {
     Timer t(std::cerr, "\tSorting SAM blocks: ", opt_verbose);
     std::vector<tthread::thread*> threads(opt_threads);
@@ -465,11 +505,12 @@ int fast_samtools_sort(const std::string& in_fname,
     for(size_t i = 0; i < opt_threads; i++) {
       threadParams[i].fname_base  = in_fname;
       threadParams[i].next_block  = &next_block;
-      threadParams[i].num_block   = file_num;
+      threadParams[i].num_block   = file_num; // Make this aligned_file_num
       threadParams[i].contig2pos  = &contig2pos;
       threadParams[i].headers     = &headers;
       threadParams[i].thread_id   = i;
       threadParams[i].num_threads = opt_threads;
+      threadParams[i].file_lines = &arrFileLines;
       threads[i] = new tthread::thread(thread_worker, (void*)&threadParams[i]);
     }
     
@@ -482,13 +523,13 @@ int fast_samtools_sort(const std::string& in_fname,
     }
   }
 
-  // DK -> CB todo
+  // DK -> CB
+  // CB todo test implementation on large BAM
   // the number of unalined reads is usually very large, perhaps over hundreds of millions
   //   and there is no need to sort unaligned reads.
   // thus, we may want to write unalinged reads directly into a BAM file using multiple threads
-  {
-    Timer t(std::cerr, "\tWriting unaligned reads: ", opt_verbose);
-  }
+  // CB: I think I got it. See Above in threadworker
+
 
   // Use samtools's cat to concatenate BAM blocks
   //  Note: sambamba hasn't implemented "cat" function
@@ -551,8 +592,8 @@ int main(int argc, char** argv) {
     if(arg_needed_options.find(option) != arg_needed_options.end()) {
       curr_argc++;
       if(curr_argc >= argc) {
-	std::cerr << "Error: option, " << option << ", needs an argument." << std::endl << std::endl;
-	return 0;
+    	  std::cerr << "Error: option, " << option << ", needs an argument." << std::endl << std::endl;
+    	  return 0;
       }
       str_value = argv[curr_argc];
       if(uint_options.find(option) != uint_options.end()) {
