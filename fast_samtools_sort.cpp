@@ -150,6 +150,7 @@ struct ThreadParam {
   Contig2Pos* contig2pos;
   std::vector<std::string>* headers;
   std::vector<fileLines>* file_lines;
+  std::vector<table_records>* table;
 
   size_t thread_id;
   size_t num_threads;
@@ -275,7 +276,7 @@ void fieldSplitter(int &pass,
 					}
 					samRecord.line = sam_cur;
 					sam_cur += (strlen(sam_cur) + 1);
-					samRecords->push_back(samRecord);
+					samRecords[(*table)[samRecord.pos / interval].num_lines].push_back(samRecord);
 					break;
 				}
 			}
@@ -291,6 +292,7 @@ void thread_worker(void* vp) {
   std::vector<std::string>& headers = *threadParam.headers;
   size_t thread_id = threadParam.thread_id;
   std::vector<fileLines>& arrFileLines = *threadParam.file_lines;
+  std::vector<table_records>& table = *threadParam.table;
     
   char* sam = new char[opt_memory_per_thread];
   
@@ -313,22 +315,25 @@ void thread_worker(void* vp) {
 
     // CB todo get bucket sort going here
     if(!arrFileLines[cur_block].bypass){
-    	std::vector<SamRecord> samRecords;
-    	samRecords.reserve(arrFileLines[cur_block].numLines);
+    	std::vector<SamRecord> samRecords[(arrFileLines[cur_block].numLines / 10000) + 1];
+    	for(size_t itr = 0; itr < (arrFileLines[cur_block].numLines / 10000) + 1 ; itr++){
+    		samRecords[itr].reserve(10000);
+    	}
+
     	{
     		Timer t(std::cerr, "\tThread #0 reading SAM", opt_verbose && thread_id == 0);
 
     		// Read SAM file
     	    int pass = 3;
     	    fieldSplitter(pass,
-    	    		nullptr,
+    	    		&table,
     	    		nullptr,
     	    		headers,
     	    		contig2pos,
     	    		cmd,
     	    		nullptr,
     	    		nullptr,
-    	    		&samRecords,
+    	    		samRecords,
     	    		sam);
     	}
 
@@ -347,7 +352,9 @@ void thread_worker(void* vp) {
     	// Sort
     	{
     		Timer t(std::cerr, "\tThread #0 sorting", opt_verbose && thread_id == 0);
-    		std::sort(samRecords.begin(), samRecords.end(), SamRecord_cmp());
+    		for(size_t i = 0; i < ((arrFileLines[cur_block].numLines / 10000) + 1); i++){
+    			std::sort(samRecords[i].begin(), samRecords[i].end(), SamRecord_cmp());
+    		}
     	}
     	if(opt_verbose && thread_id == 0) {
     		#if 0
@@ -376,9 +383,11 @@ void thread_worker(void* vp) {
     		for(size_t i = 0; i < headers.size(); i++) {
     			fputs(headers[i].c_str(), pipe2.get());
     		}
-    		for(size_t i = 0; i < samRecords.size(); i++) {
-    			const SamRecord& samRecord = samRecords[i];
-    			fputs(samRecord.line, pipe2.get());
+    		for(size_t i = 0; i < ((arrFileLines[cur_block].numLines / 10000) + 1); i++){
+    			for(size_t j = 0; j < samRecords[i].size(); j++) {
+    				const SamRecord& samRecord = samRecords[i][j];
+    				fputs(samRecord.line, pipe2.get());
+    		}
     		}
     	}
 
@@ -450,6 +459,7 @@ int fast_samtools_sort(const std::string& in_fname, const std::string& out_fname
   fileLines lines_per_file;
   std::vector<fileLines> arrFileLines;
   assert(table_size != 0);
+
   for(size_t itr = 0; itr < (table_size - 1); itr++) {
     assert(sam_size <= opt_memory_per_thread);
     if(sam_size + table[itr].num_char > opt_memory_per_thread) {
@@ -461,11 +471,14 @@ int fast_samtools_sort(const std::string& in_fname, const std::string& out_fname
       sam_size += table[itr].num_char;
       lines_per_file.numLines += table[itr].num_lines;
     }
+    table[itr].num_lines = (lines_per_file.numLines / 10000);
     table[itr].num_char = file_num - 1;
   }
   arrFileLines.push_back(lines_per_file);
+
   aligned_file_num = file_num;
   file_num += (table.size() - (table_size - 1));
+
   for(size_t itr = (table_size - 1); itr < table.size(); itr++){
 	  lines_per_file.numLines = table[itr].num_lines;
 	  lines_per_file.bypass = 1;
@@ -511,6 +524,7 @@ int fast_samtools_sort(const std::string& in_fname, const std::string& out_fname
       threadParams[i].thread_id   = i;
       threadParams[i].num_threads = opt_threads;
       threadParams[i].file_lines = &arrFileLines;
+      threadParams[i].table = &table;
       threads[i] = new tthread::thread(thread_worker, (void*)&threadParams[i]);
     }
     
